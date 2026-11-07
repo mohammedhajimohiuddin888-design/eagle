@@ -1,0 +1,6 @@
+{
+  "name": "EAGLE — Altitude Vision Platform",
+  "description": "A premium cinematic 3D website featuring high-altitude intelligence, realistic animated eagle simulation, and aerial coverage research.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
