@@ -7,10 +7,12 @@
  * - Single clean top Navbar.
  * - Dynamic phase-based titles, subtitles, and telemetry that reveal as you scroll or swipe.
  * - Upward kinetic translation: titles and written copy glide upward with scroll momentum.
- * - Mobile optimized: zero overlap, dynamic viewport height (dvh), seamless touch scrub & tilt.
+ * - High-performance video scrub engine: fastSeek + queued frame seeking prevents lagging.
+ * - Decoupled React state: direct DOM updates for progress bar, GPU-accelerated translate3d.
+ * - Mobile optimized: zero layout thrashing, touch-inertia, 60-120fps smooth on all devices.
  */
 
-import React, { useRef, useEffect, useState, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   ArrowUpRight,
@@ -208,15 +210,24 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const progressBarFillRef = useRef<HTMLDivElement>(null);
+  const progressPercentRef = useRef<HTMLSpanElement>(null);
+  const headlineDriftRef = useRef<HTMLDivElement>(null);
+  const cardRectRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
 
+  // Discrete React state for UI triggers
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
-  const [flightProgress, setFlightProgress] = useState(0);
   const [currentPhase, setCurrentPhase] = useState(1);
   const [videoDuration, setVideoDuration] = useState(10);
   const [interactiveMode, setInteractiveMode] = useState<'wheel' | 'autoplay'>('wheel');
 
-  // Tilt refs for smooth 60fps damped transform (mouse or touch)
+  // Real-time synchronization refs (zero React re-renders during 60-120fps interactions)
+  const currentPhaseRef = useRef(1);
+  const interactiveModeRef = useRef<'wheel' | 'autoplay'>('wheel');
+  interactiveModeRef.current = interactiveMode;
+
+  // Tilt tracking for smooth 60fps 3D desktop perspective
   const tiltRef = useRef({
     x: 0,
     y: 0,
@@ -224,30 +235,73 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
     targetY: 0,
   });
 
-  // Progress ref for smooth wheel & touch accumulation and lerp
+  // Flight progress tracking
   const progressRef = useRef({
     current: 0,
     target: 0,
   });
+
+  // Video seeking state machine (prevents decoder queue congestion and lag)
+  const isSeekingRef = useRef(false);
+  const pendingSeekTimeRef = useRef<number | null>(null);
 
   // Multi-axis Touch tracking for mobile
   const touchStartXRef = useRef(0);
   const touchStartYRef = useRef(0);
   const isTouchingRef = useRef(false);
 
+  // Request seek with decoder queue guard and fastSeek acceleration
+  const requestSeek = useCallback((targetTime: number) => {
+    const video = videoRef.current;
+    if (!video || !video.duration) return;
+
+    const clampedTime = Math.max(0, Math.min(video.duration, targetTime));
+
+    // If within ~0.02s of current position, skip redundant seek
+    if (Math.abs(video.currentTime - clampedTime) < 0.02) return;
+
+    if (isSeekingRef.current) {
+      pendingSeekTimeRef.current = clampedTime;
+      return;
+    }
+
+    isSeekingRef.current = true;
+    pendingSeekTimeRef.current = null;
+
+    if (typeof (video as any).fastSeek === 'function') {
+      try {
+        (video as any).fastSeek(clampedTime);
+      } catch {
+        video.currentTime = clampedTime;
+      }
+    } else {
+      video.currentTime = clampedTime;
+    }
+  }, []);
+
+  const handleSeeked = useCallback(() => {
+    isSeekingRef.current = false;
+    if (pendingSeekTimeRef.current !== null) {
+      const nextTarget = pendingSeekTimeRef.current;
+      pendingSeekTimeRef.current = null;
+      requestSeek(nextTarget);
+    }
+  }, [requestSeek]);
+
   const handleLoadedMetadata = () => {
     if (videoRef.current && videoRef.current.duration) {
-      setVideoDuration(videoRef.current.duration);
+      const dur = videoRef.current.duration;
+      setVideoDuration(dur);
+      requestSeek(progressRef.current.current * dur);
     }
   };
 
   // Wheel & Touch gesture listeners
   useEffect(() => {
     const handleWheel = (e: WheelEvent) => {
-      // Prevent browser from scrolling the document
       e.preventDefault();
 
-      if (interactiveMode === 'autoplay') {
+      if (interactiveModeRef.current === 'autoplay') {
         if (videoRef.current) {
           videoRef.current.pause();
           setIsPlaying(false);
@@ -262,7 +316,7 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
       progressRef.current.target = nextTarget;
     };
 
-    // Mobile touch listeners: smooth swipe in any direction + 3D tilt
+    // Mobile touch listeners: smooth swipe with touch-inertia
     const handleTouchStart = (e: TouchEvent) => {
       if (e.touches.length > 0) {
         touchStartXRef.current = e.touches[0].clientX;
@@ -273,7 +327,6 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
 
     const handleTouchMove = (e: TouchEvent) => {
       if (e.touches.length > 0) {
-        // Prevent mobile browser pull-to-refresh & navigation
         if (e.cancelable) e.preventDefault();
 
         const currentX = e.touches[0].clientX;
@@ -283,16 +336,7 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
         touchStartXRef.current = currentX;
         touchStartYRef.current = currentY;
 
-        // Mobile 3D tilt tracking from touch position
-        if (cardRef.current) {
-          const rect = cardRef.current.getBoundingClientRect();
-          const normX = ((currentX - rect.left) / rect.width) * 2 - 1;
-          const normY = ((currentY - rect.top) / rect.height) * 2 - 1;
-          tiltRef.current.targetX = Math.max(-1, Math.min(1, normX));
-          tiltRef.current.targetY = Math.max(-1, Math.min(1, normY));
-        }
-
-        if (interactiveMode === 'autoplay') {
+        if (interactiveModeRef.current === 'autoplay') {
           if (videoRef.current) {
             videoRef.current.pause();
             setIsPlaying(false);
@@ -300,9 +344,9 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
           setInteractiveMode('wheel');
         }
 
-        // Natural touch sensitivity: support both vertical swipe & horizontal swipe
+        // Natural touch sensitivity: support both vertical and horizontal swipe
         const dominantDelta = Math.abs(diffY) >= Math.abs(diffX) ? diffY : diffX;
-        const sensitivity = 0.0032;
+        const sensitivity = 0.0028;
         const nextTarget = Math.max(0, Math.min(1, progressRef.current.target + dominantDelta * sensitivity));
         progressRef.current.target = nextTarget;
       }
@@ -310,13 +354,6 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
 
     const handleTouchEnd = () => {
       isTouchingRef.current = false;
-      // Smoothly return perspective tilt towards neutral center after touch release
-      setTimeout(() => {
-        if (!isTouchingRef.current) {
-          tiltRef.current.targetX = 0;
-          tiltRef.current.targetY = 0;
-        }
-      }, 400);
     };
 
     const node = containerRef.current || window;
@@ -331,76 +368,30 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
       node.removeEventListener('touchmove', handleTouchMove as any);
       node.removeEventListener('touchend', handleTouchEnd as any);
     };
-  }, [interactiveMode]);
+  }, []);
 
-  // 60FPS animation loop for 3D perspective tilt and smooth video scrub
-  useEffect(() => {
-    let animId = 0;
+  // Desktop Mouse move handler with cached bounding rect (eliminates layout thrashing)
+  const handleMouseEnter = () => {
+    if (cardRef.current) {
+      const rect = cardRef.current.getBoundingClientRect();
+      cardRectRef.current = {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      };
+    }
+  };
 
-    const tick = () => {
-      // 1. Tilt lerp
-      tiltRef.current.x += (tiltRef.current.targetX - tiltRef.current.x) * 0.08;
-      tiltRef.current.y += (tiltRef.current.targetY - tiltRef.current.y) * 0.08;
-
-      if (cardRef.current) {
-        const tiltX = -tiltRef.current.y * 6.5; // Max 6.5 deg pitch
-        const tiltY = tiltRef.current.x * 8.5;  // Max 8.5 deg yaw
-        cardRef.current.style.transform = `perspective(1400px) rotateX(${tiltX.toFixed(2)}deg) rotateY(${tiltY.toFixed(2)}deg)`;
-      }
-
-      // 2. Smooth flight progress lerp
-      if (interactiveMode === 'wheel') {
-        const pDiff = progressRef.current.target - progressRef.current.current;
-        if (Math.abs(pDiff) > 0.00015) {
-          progressRef.current.current += pDiff * 0.14;
-          const currentP = progressRef.current.current;
-          setFlightProgress(currentP);
-
-          // Synchronize phase with actual lerped progress
-          let nextPhase = 1;
-          if (currentP < 0.2) nextPhase = 1;
-          else if (currentP < 0.45) nextPhase = 2;
-          else if (currentP < 0.65) nextPhase = 3;
-          else if (currentP < 0.85) nextPhase = 4;
-          else nextPhase = 5;
-          setCurrentPhase(nextPhase);
-
-          // Update video currentTime
-          if (videoRef.current && !videoRef.current.seeking) {
-            const dur = videoRef.current.duration || videoDuration;
-            const targetTime = currentP * dur;
-            try {
-              videoRef.current.currentTime = targetTime;
-            } catch {
-              // Ignore seek throttling
-            }
-          }
-        }
-      } else if (interactiveMode === 'autoplay' && videoRef.current) {
-        const dur = videoRef.current.duration || videoDuration;
-        const currentP = dur > 0 ? videoRef.current.currentTime / dur : 0;
-        setFlightProgress(currentP);
-        progressRef.current.current = currentP;
-        progressRef.current.target = currentP;
-
-        if (currentP < 0.2) setCurrentPhase(1);
-        else if (currentP < 0.45) setCurrentPhase(2);
-        else if (currentP < 0.65) setCurrentPhase(3);
-        else if (currentP < 0.85) setCurrentPhase(4);
-        else setCurrentPhase(5);
-      }
-
-      animId = requestAnimationFrame(tick);
-    };
-
-    animId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(animId);
-  }, [interactiveMode, videoDuration]);
-
-  // Desktop Mouse move handler for 3D tilt
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!cardRef.current) return;
-    const rect = cardRef.current.getBoundingClientRect();
+    let rect = cardRectRef.current;
+    if (!rect && cardRef.current) {
+      const r = cardRef.current.getBoundingClientRect();
+      rect = { left: r.left, top: r.top, width: r.width, height: r.height };
+      cardRectRef.current = rect;
+    }
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+
     const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     const y = ((e.clientY - rect.top) / rect.height) * 2 - 1;
     tiltRef.current.targetX = Math.max(-1, Math.min(1, x));
@@ -410,7 +401,110 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
   const handleMouseLeave = () => {
     tiltRef.current.targetX = 0;
     tiltRef.current.targetY = 0;
+    cardRectRef.current = null;
   };
+
+  // 60-120FPS animation loop for perspective tilt and direct progress updates
+  useEffect(() => {
+    let animId = 0;
+
+    const tick = () => {
+      // 1. Tilt lerp (Desktop mouse perspective tilt)
+      tiltRef.current.x += (tiltRef.current.targetX - tiltRef.current.x) * 0.08;
+      tiltRef.current.y += (tiltRef.current.targetY - tiltRef.current.y) * 0.08;
+
+      if (cardRef.current && (Math.abs(tiltRef.current.x) > 0.001 || Math.abs(tiltRef.current.y) > 0.001)) {
+        const tiltX = -tiltRef.current.y * 5.0; // Max 5 deg pitch
+        const tiltY = tiltRef.current.x * 6.5;  // Max 6.5 deg yaw
+        cardRef.current.style.transform = `perspective(1200px) rotateX(${tiltX.toFixed(2)}deg) rotateY(${tiltY.toFixed(2)}deg) translate3d(0,0,0)`;
+      }
+
+      // 2. Flight progress lerp and direct DOM updates
+      if (interactiveModeRef.current === 'wheel') {
+        const pDiff = progressRef.current.target - progressRef.current.current;
+        if (Math.abs(pDiff) > 0.0001) {
+          const lerpSpeed = isTouchingRef.current ? 0.24 : 0.16;
+          progressRef.current.current += pDiff * lerpSpeed;
+        } else {
+          progressRef.current.current = progressRef.current.target;
+        }
+
+        const currentP = progressRef.current.current;
+
+        // Direct DOM updates for progress bar and percentage (Zero React re-render overhead)
+        if (progressBarFillRef.current) {
+          progressBarFillRef.current.style.width = `${(currentP * 100).toFixed(1)}%`;
+        }
+        if (progressPercentRef.current) {
+          progressPercentRef.current.textContent = `${Math.round(currentP * 100)}%`;
+        }
+
+        // Determine phase
+        let nextPhase = 1;
+        if (currentP < 0.2) nextPhase = 1;
+        else if (currentP < 0.45) nextPhase = 2;
+        else if (currentP < 0.65) nextPhase = 3;
+        else if (currentP < 0.85) nextPhase = 4;
+        else nextPhase = 5;
+
+        // Kinetic upward drift on headline via GPU translate3d
+        if (headlineDriftRef.current) {
+          const activeRange = PHASES_DATA[nextPhase]?.range || [0, 0.2];
+          const intra = Math.max(0, Math.min(1, (currentP - activeRange[0]) / (activeRange[1] - activeRange[0])));
+          const driftY = intra * 20;
+          headlineDriftRef.current.style.transform = `translate3d(0, -${driftY.toFixed(1)}px, 0)`;
+        }
+
+        // Only trigger React render when crossing phase boundary
+        if (nextPhase !== currentPhaseRef.current) {
+          currentPhaseRef.current = nextPhase;
+          setCurrentPhase(nextPhase);
+        }
+
+        // Asynchronously seek video without saturating the media pipeline
+        if (videoRef.current) {
+          const dur = videoRef.current.duration || videoDuration;
+          requestSeek(currentP * dur);
+        }
+      } else if (interactiveModeRef.current === 'autoplay' && videoRef.current) {
+        const dur = videoRef.current.duration || videoDuration;
+        const currentP = dur > 0 ? videoRef.current.currentTime / dur : 0;
+        progressRef.current.current = currentP;
+        progressRef.current.target = currentP;
+
+        if (progressBarFillRef.current) {
+          progressBarFillRef.current.style.width = `${(currentP * 100).toFixed(1)}%`;
+        }
+        if (progressPercentRef.current) {
+          progressPercentRef.current.textContent = `${Math.round(currentP * 100)}%`;
+        }
+
+        let nextPhase = 1;
+        if (currentP < 0.2) nextPhase = 1;
+        else if (currentP < 0.45) nextPhase = 2;
+        else if (currentP < 0.65) nextPhase = 3;
+        else if (currentP < 0.85) nextPhase = 4;
+        else nextPhase = 5;
+
+        if (headlineDriftRef.current) {
+          const activeRange = PHASES_DATA[nextPhase]?.range || [0, 0.2];
+          const intra = Math.max(0, Math.min(1, (currentP - activeRange[0]) / (activeRange[1] - activeRange[0])));
+          const driftY = intra * 20;
+          headlineDriftRef.current.style.transform = `translate3d(0, -${driftY.toFixed(1)}px, 0)`;
+        }
+
+        if (nextPhase !== currentPhaseRef.current) {
+          currentPhaseRef.current = nextPhase;
+          setCurrentPhase(nextPhase);
+        }
+      }
+
+      animId = requestAnimationFrame(tick);
+    };
+
+    animId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animId);
+  }, [videoDuration, requestSeek]);
 
   // Toggle playback mode
   const togglePlay = () => {
@@ -421,7 +515,7 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
       setInteractiveMode('wheel');
     } else {
       setInteractiveMode('autoplay');
-      videoRef.current.play();
+      videoRef.current.play().catch(() => {});
       setIsPlaying(true);
     }
   };
@@ -439,9 +533,17 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
     videoRef.current.currentTime = 0;
     progressRef.current.current = 0;
     progressRef.current.target = 0;
-    setFlightProgress(0);
+    currentPhaseRef.current = 1;
     setCurrentPhase(1);
-    videoRef.current.play();
+
+    if (progressBarFillRef.current) {
+      progressBarFillRef.current.style.width = '0%';
+    }
+    if (progressPercentRef.current) {
+      progressPercentRef.current.textContent = '0%';
+    }
+
+    videoRef.current.play().catch(() => {});
     setIsPlaying(true);
     setInteractiveMode('autoplay');
   };
@@ -454,27 +556,26 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
       4: 0.75,
       5: 0.95,
     };
-    const p = progressMap[phase] || 0;
+    const p = progressMap[phase] ?? 0;
     progressRef.current.target = p;
+    progressRef.current.current = p;
+    currentPhaseRef.current = phase;
     setCurrentPhase(phase);
-    if (interactiveMode === 'autoplay') {
-      if (videoRef.current) {
-        const dur = videoRef.current.duration || videoDuration;
-        videoRef.current.currentTime = p * dur;
-      }
+
+    if (progressBarFillRef.current) {
+      progressBarFillRef.current.style.width = `${(p * 100).toFixed(1)}%`;
+    }
+    if (progressPercentRef.current) {
+      progressPercentRef.current.textContent = `${Math.round(p * 100)}%`;
+    }
+
+    if (videoRef.current) {
+      const dur = videoRef.current.duration || videoDuration;
+      requestSeek(p * dur);
     }
   };
 
   const activeContent = PHASES_DATA[currentPhase] || PHASES_DATA[1];
-
-  // Calculate subtle continuous upward drift based on progress within the active phase
-  const intraProgress = useMemo(() => {
-    const [minP, maxP] = activeContent.range;
-    return Math.max(0, Math.min(1, (flightProgress - minP) / (maxP - minP)));
-  }, [activeContent.range, flightProgress]);
-
-  // Upward translation offset in pixels (0px to 20px upward drift as wheel/touch scrubs)
-  const upwardDrift = intraProgress * 20;
 
   // Helper icon renderer
   const renderMetricIcon = (iconName: string, accent: string) => {
@@ -511,21 +612,26 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
       {/* Main 3D Card with Perspective Parallax */}
       <div
         ref={cardRef}
+        onMouseEnter={handleMouseEnter}
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
         style={{ willChange: 'transform', touchAction: 'none' }}
-        className="relative w-full max-w-7xl flex-1 max-h-[84dvh] sm:max-h-[82vh] rounded-[20px] sm:rounded-[36px] bg-[#C5DCF0] overflow-hidden border border-black/[0.08] shadow-[0_25px_60px_-15px_rgba(20,25,35,0.18)] transition-shadow duration-300"
+        className="relative w-full max-w-7xl flex-1 max-h-[84dvh] sm:max-h-[82vh] rounded-[20px] sm:rounded-[36px] bg-[#C5DCF0] overflow-hidden border border-black/[0.08] shadow-[0_20px_50px_-15px_rgba(20,25,35,0.18)]"
       >
-        {/* Pristine High-Resolution Source Video */}
-        <div className="absolute inset-0 w-full h-full bg-[#9AC3E6]">
+        {/* Source Video - High-Resolution 1080p Eagle with FastStart metadata */}
+        <div className="absolute inset-0 w-full h-full bg-[#9AC3E6] overflow-hidden">
           <video
             ref={videoRef}
-            src="/assets/aistudio/Eagle_1_1304c0c3.mp4"
-            className="w-full h-full object-cover pointer-events-none"
+            src="/assets/aistudio/Eagle_flying_toward_camera_953baa6a_1080p.mp4"
+            className="w-full h-full object-cover pointer-events-none transform-gpu"
             muted={isMuted}
             playsInline
+            webkit-playsinline="true"
             preload="auto"
+            disablePictureInPicture
+            disableRemotePlayback
             onLoadedMetadata={handleLoadedMetadata}
+            onSeeked={handleSeeked}
             onEnded={() => {
               setIsPlaying(false);
               setInteractiveMode('wheel');
@@ -535,25 +641,25 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
           {/* Subtle atmospheric natural scrim */}
           <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-black/10 pointer-events-none" />
 
-          {/* Dynamic Cursor / Finger Light Sheen */}
+          {/* Subtle ambient light gradient sheen */}
           <div
-            className="absolute inset-0 pointer-events-none opacity-40 transition-opacity duration-300"
+            className="absolute inset-0 pointer-events-none opacity-30"
             style={{
-              background: `radial-gradient(circle 500px at ${(tiltRef.current.x * 0.5 + 0.5) * 100}% ${(tiltRef.current.y * 0.5 + 0.5) * 100}%, rgba(255, 250, 235, 0.25) 0%, transparent 70%)`,
+              background: 'radial-gradient(circle 600px at 50% 40%, rgba(255, 250, 235, 0.2) 0%, transparent 70%)',
             }}
           />
         </div>
 
-        {/* --- SLEEK MINIMAL TOP TELEMETRY BAR (NO duplicate site navbar) --- */}
+        {/* --- SLEEK MINIMAL TOP TELEMETRY BAR --- */}
         <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-3.5 sm:px-10 py-3 sm:py-5 pointer-events-none">
-          <div className="flex items-center gap-2 bg-black/25 backdrop-blur-md px-3 py-1 sm:px-3.5 sm:py-1.5 rounded-full border border-white/20">
+          <div className="flex items-center gap-2 bg-[#141311]/75 backdrop-blur-sm px-3 py-1 sm:px-3.5 sm:py-1.5 rounded-full border border-white/20">
             <span className="w-1.5 sm:w-2 h-1.5 sm:h-2 rounded-full bg-emerald-400 animate-pulse" />
             <span className="text-[9px] sm:text-[10px] font-mono tracking-[0.16em] text-white/90 uppercase font-semibold">
               LIVE STREAM · {activeContent.corridor}
             </span>
           </div>
 
-          <div className="hidden sm:flex items-center gap-3 text-[10px] font-mono text-white/80 bg-black/20 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/15">
+          <div className="hidden sm:flex items-center gap-3 text-[10px] font-mono text-white/80 bg-[#141311]/70 backdrop-blur-sm px-3 py-1.5 rounded-full border border-white/15">
             <span>FOV 114°</span>
             <span className="text-white/40">·</span>
             <span>240 FPS SENSOR</span>
@@ -563,29 +669,27 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
         </div>
 
         {/* --- LEFT SIDE: KINETIC SCROLL-DRIVEN EDITORIAL HEADLINE & SUBTITLES --- */}
-        <div className="absolute left-3.5 sm:left-12 bottom-13 sm:bottom-20 z-20 max-w-sm sm:max-w-lg pointer-events-auto">
-          {/* Animated phase content with upward entrance, exit, and real-time scroll drift */}
+        <div className="absolute left-3.5 sm:left-12 bottom-12 sm:bottom-20 z-20 max-w-sm sm:max-w-lg pointer-events-auto">
+          {/* Animated phase content with direct GPU kinetic translation */}
           <div
-            style={{
-              transform: `translateY(-${upwardDrift.toFixed(1)}px)`,
-              transition: 'transform 0.08s linear',
-            }}
+            ref={headlineDriftRef}
+            className="will-change-transform"
           >
             <AnimatePresence mode="wait">
               <motion.div
                 key={`headline-phase-${currentPhase}`}
-                initial={{ opacity: 0, y: 42 }}
+                initial={{ opacity: 0, y: 32 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -42 }}
-                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+                exit={{ opacity: 0, y: -32 }}
+                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 className="space-y-2 sm:space-y-4"
               >
                 {/* Dynamic Phase Tag Badge */}
                 <motion.div
-                  initial={{ opacity: 0, y: 16 }}
+                  initial={{ opacity: 0, y: 14 }}
                   animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.35, delay: 0.05 }}
-                  className="inline-flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-0.5 sm:py-1 rounded-full bg-black/30 backdrop-blur-md border border-white/30 text-[9px] sm:text-[10px] font-mono tracking-[0.16em] text-white font-semibold uppercase shadow-xs"
+                  transition={{ duration: 0.3, delay: 0.05 }}
+                  className="inline-flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-0.5 sm:py-1 rounded-full bg-[#141311]/75 backdrop-blur-sm border border-white/30 text-[9px] sm:text-[10px] font-mono tracking-[0.16em] text-white font-semibold uppercase shadow-xs"
                 >
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
                   <span>{activeContent.tag}</span>
@@ -593,9 +697,9 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
 
                 {/* Editorial Serif Title (Upward kinetic motion) */}
                 <motion.h1
-                  initial={{ opacity: 0, y: 32 }}
+                  initial={{ opacity: 0, y: 24 }}
                   animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.5, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
+                  transition={{ duration: 0.45, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
                   className="font-editorial text-[34px] sm:text-6xl md:text-7xl lg:text-[80px] font-normal leading-[0.93] tracking-[-0.025em] text-[#1B1A17] drop-shadow-[0_2px_12px_rgba(255,255,255,0.45)]"
                 >
                   <span className="block font-light text-[#1B1A17]">{activeContent.titleLine1}</span>
@@ -604,9 +708,9 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
 
                 {/* Dynamic Subtitle & Written Information */}
                 <motion.div
-                  initial={{ opacity: 0, y: 20 }}
+                  initial={{ opacity: 0, y: 16 }}
                   animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.45, delay: 0.14 }}
+                  transition={{ duration: 0.4, delay: 0.12 }}
                   className="space-y-1 max-w-xs sm:max-w-md"
                 >
                   <p className="text-[11px] sm:text-[14px] text-[#24211B] font-medium leading-relaxed drop-shadow-[0_1px_4px_rgba(255,255,255,0.7)] line-clamp-2 sm:line-clamp-none">
@@ -616,13 +720,13 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
                     {activeContent.subDescription}
                   </p>
 
-                  {/* Mobile-only compact telemetry pills to prevent card overlap */}
+                  {/* Mobile-only compact telemetry pills */}
                   <div className="flex sm:hidden items-center gap-1.5 pt-1">
-                    <span className="px-2 py-0.5 rounded-md bg-black/45 backdrop-blur-xs text-[9px] font-mono text-white flex items-center gap-1 border border-white/10">
+                    <span className="px-2 py-0.5 rounded-md bg-[#141311]/75 backdrop-blur-xs text-[9px] font-mono text-white flex items-center gap-1 border border-white/10">
                       <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
                       <span>{activeContent.metrics.card1.label}: <strong className="text-amber-300">{activeContent.metrics.card1.value}</strong></span>
                     </span>
-                    <span className="px-2 py-0.5 rounded-md bg-black/45 backdrop-blur-xs text-[9px] font-mono text-white flex items-center gap-1 border border-white/10">
+                    <span className="px-2 py-0.5 rounded-md bg-[#141311]/75 backdrop-blur-xs text-[9px] font-mono text-white flex items-center gap-1 border border-white/10">
                       <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
                       <span>{activeContent.metrics.card2.label}: <strong className="text-sky-300">{activeContent.metrics.card2.value}</strong></span>
                     </span>
@@ -632,11 +736,11 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
             </AnimatePresence>
           </div>
 
-          {/* Action Callouts & CTA (Anchor positioned for stability) */}
-          <div className="pt-2 sm:pt-3.5 flex items-center gap-2 sm:gap-3">
+          {/* Action Callouts & CTA */}
+          <div className="pt-2 sm:pt-3 flex items-center gap-2 sm:gap-3">
             <button
               onClick={onOpenAccess}
-              className="group flex items-center gap-1.5 sm:gap-2 px-4 sm:px-5 py-2 sm:py-2.5 bg-[#E8BD4D] hover:bg-[#DDAE3C] text-[#1B1A17] font-semibold text-[11px] sm:text-xs tracking-wider uppercase rounded-full shadow-[0_4px_16px_rgba(232,189,77,0.35)] transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+              className="group flex items-center gap-1.5 sm:gap-2 px-4 sm:px-5 py-2 sm:py-2.5 bg-[#E8BD4D] hover:bg-[#DDAE3C] text-[#1B1A17] font-semibold text-[11px] sm:text-xs tracking-wider uppercase rounded-full shadow-[0_4px_16px_rgba(232,189,77,0.35)] transition-transform hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
             >
               <span>Start Free</span>
               <ArrowUpRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
@@ -651,21 +755,21 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
           </div>
         </div>
 
-        {/* --- RIGHT SIDE: DYNAMIC TELEMETRY CARDS (Desktop & Tablet only; mobile has inline pills) --- */}
+        {/* --- RIGHT SIDE: DYNAMIC TELEMETRY CARDS (Desktop & Tablet) --- */}
         <div className="hidden sm:flex absolute right-6 sm:right-10 bottom-16 sm:bottom-20 z-20 pointer-events-auto">
           <AnimatePresence mode="wait">
             <motion.div
               key={`cards-phase-${currentPhase}`}
-              initial={{ opacity: 0, y: 35 }}
+              initial={{ opacity: 0, y: 28 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -35 }}
-              transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
+              exit={{ opacity: 0, y: -28 }}
+              transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
               className="flex flex-col sm:flex-row gap-3"
             >
               {/* Telemetry Card 1 */}
               <div
                 onClick={() => onOpenInfoModal?.(activeContent.metrics.card1.label, activeContent.metrics.card1.sub)}
-                className="w-36 sm:w-40 p-3 rounded-2xl bg-black/65 backdrop-blur-md border border-white/15 text-white shadow-xl hover:scale-105 hover:bg-black/80 transition-all duration-200 cursor-pointer"
+                className="w-36 sm:w-40 p-3 rounded-2xl bg-[#141311]/80 backdrop-blur-sm border border-white/15 text-white shadow-xl hover:scale-105 hover:bg-[#141311]/90 transition-transform duration-200 cursor-pointer"
               >
                 <div className="w-full h-14 rounded-xl bg-gradient-to-br from-black/80 to-black/95 overflow-hidden relative mb-2.5 border border-white/10 flex items-center justify-center">
                   <div className="absolute inset-0 opacity-40 bg-[radial-gradient(#F59E0B_1px,transparent_1px)] [background-size:8px_8px]" />
@@ -700,7 +804,7 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
               {/* Telemetry Card 2 */}
               <div
                 onClick={() => onOpenInfoModal?.(activeContent.metrics.card2.label, activeContent.metrics.card2.sub)}
-                className="w-36 sm:w-40 p-3 rounded-2xl bg-black/65 backdrop-blur-md border border-white/15 text-white shadow-xl hover:scale-105 hover:bg-black/80 transition-all duration-200 cursor-pointer"
+                className="w-36 sm:w-40 p-3 rounded-2xl bg-[#141311]/80 backdrop-blur-sm border border-white/15 text-white shadow-xl hover:scale-105 hover:bg-[#141311]/90 transition-transform duration-200 cursor-pointer"
               >
                 <div className="w-full h-14 rounded-xl bg-gradient-to-br from-black/80 to-black/95 overflow-hidden relative mb-2.5 border border-white/10 flex items-center justify-center">
                   <div className="absolute inset-0 opacity-40 bg-[radial-gradient(#38BDF8_1px,transparent_1px)] [background-size:8px_8px]" />
@@ -739,20 +843,20 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
         <div className="absolute bottom-2.5 sm:bottom-3 inset-x-3 sm:inset-x-10 z-20 flex items-center justify-between text-[11px] text-black/70 pointer-events-auto">
           {/* Dynamic Flight Action Indicator & Phase Pills */}
           <div className="flex items-center gap-2 sm:gap-3">
-            <div className="hidden md:flex items-center gap-2 bg-black/10 backdrop-blur-xs px-3 py-1 rounded-full border border-black/5">
-              <span className="font-semibold text-black/85 text-[10px]">{activeContent.eagleAction}</span>
+            <div className="hidden md:flex items-center gap-2 bg-[#141311]/60 backdrop-blur-xs px-3 py-1 rounded-full border border-white/15">
+              <span className="font-semibold text-white/90 text-[10px]">{activeContent.eagleAction}</span>
             </div>
 
-            {/* Phase jump selector with thumb-friendly touch targets on mobile */}
-            <div className="flex items-center gap-0.5 sm:gap-1 bg-black/20 backdrop-blur-sm rounded-full p-0.5 sm:p-1 border border-white/30">
+            {/* Phase jump selector with thumb-friendly touch targets */}
+            <div className="flex items-center gap-0.5 sm:gap-1 bg-[#141311]/65 backdrop-blur-sm rounded-full p-0.5 sm:p-1 border border-white/20">
               {[1, 2, 3, 4, 5].map((p) => (
                 <button
                   key={p}
                   onClick={() => jumpToPhase(p)}
-                  className={`px-2 sm:px-2.5 py-1 sm:py-0.5 rounded-full text-[10px] sm:text-[11px] font-medium transition-all cursor-pointer ${
+                  className={`px-2 sm:px-2.5 py-1 sm:py-0.5 rounded-full text-[10px] sm:text-[11px] font-medium transition-colors cursor-pointer ${
                     currentPhase === p
-                      ? 'bg-[#1B1A17] text-white shadow-xs font-semibold'
-                      : 'text-black/75 hover:text-black hover:bg-black/10'
+                      ? 'bg-amber-400 text-black shadow-xs font-bold'
+                      : 'text-white/80 hover:text-white hover:bg-white/15'
                   }`}
                   title={`Jump to Phase ${p}: ${PHASES_DATA[p]?.tag}`}
                 >
@@ -766,16 +870,16 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
           <div className="flex items-center gap-1 sm:gap-2">
             <button
               onClick={togglePlay}
-              className="flex items-center gap-1 px-2.5 sm:px-3 py-1 rounded-full bg-black/20 hover:bg-black/30 text-black font-semibold text-[10px] sm:text-[11px] transition-colors cursor-pointer border border-white/20"
+              className="flex items-center gap-1 px-2.5 sm:px-3 py-1 rounded-full bg-[#141311]/65 hover:bg-[#141311]/80 text-white font-semibold text-[10px] sm:text-[11px] transition-colors cursor-pointer border border-white/20"
               title={isPlaying ? 'Pause Auto Video' : 'Play Continuous Video'}
             >
-              {isPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+              {isPlaying ? <Pause className="w-3 h-3 text-amber-400" /> : <Play className="w-3 h-3 text-amber-400" />}
               <span className="hidden xs:inline">{isPlaying ? 'Pause' : 'Auto'}</span>
             </button>
 
             <button
               onClick={restartVideo}
-              className="p-1 sm:p-1.5 rounded-full bg-black/20 hover:bg-black/30 text-black transition-colors cursor-pointer border border-white/20"
+              className="p-1 sm:p-1.5 rounded-full bg-[#141311]/65 hover:bg-[#141311]/80 text-white transition-colors cursor-pointer border border-white/20"
               title="Restart Flight Sequence"
             >
               <RotateCcw className="w-3 h-3" />
@@ -783,28 +887,29 @@ export const ScrollVideoHero: React.FC<ScrollVideoHeroProps> = ({
 
             <button
               onClick={toggleMute}
-              className="p-1 sm:p-1.5 rounded-full bg-black/20 hover:bg-black/30 text-black transition-colors cursor-pointer border border-white/20"
+              className="p-1 sm:p-1.5 rounded-full bg-[#141311]/65 hover:bg-[#141311]/80 text-white transition-colors cursor-pointer border border-white/20"
               title={isMuted ? 'Unmute Sound' : 'Mute Sound'}
             >
-              {isMuted ? <VolumeX className="w-3 h-3" /> : <Volume2 className="w-3 h-3" />}
+              {isMuted ? <VolumeX className="w-3 h-3 text-white/70" /> : <Volume2 className="w-3 h-3 text-amber-400" />}
             </button>
           </div>
         </div>
       </div>
 
       {/* --- BOTTOM STATUS & INTERACTION INSTRUCTION BAR --- */}
-      <div className="w-full max-w-7xl pt-1.5 px-2 flex items-center justify-between text-[10px] sm:text-[11px] text-black/60 font-mono">
+      <div className="w-full max-w-7xl pt-1 px-2 flex items-center justify-between text-[10px] sm:text-[11px] text-black/60 font-mono">
         <div className="flex items-center gap-2 sm:gap-2.5">
           <span className="font-semibold text-black/80">
             {interactiveMode === 'autoplay' ? 'AUTOPLAY' : 'SWIPE / SCROLL'}
           </span>
           <div className="w-16 sm:w-36 h-1.5 bg-black/15 rounded-full overflow-hidden">
             <div
-              className="h-full bg-amber-500 rounded-full transition-all duration-75"
-              style={{ width: `${(flightProgress * 100).toFixed(1)}%` }}
+              ref={progressBarFillRef}
+              className="h-full bg-amber-500 rounded-full"
+              style={{ width: '0%' }}
             />
           </div>
-          <span className="tabular-nums font-semibold">{Math.round(flightProgress * 100)}%</span>
+          <span ref={progressPercentRef} className="tabular-nums font-semibold">0%</span>
         </div>
 
         <div className="flex items-center gap-1.5 sm:gap-2">

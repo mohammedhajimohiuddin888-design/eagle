@@ -79,12 +79,14 @@ export const HeroSection: React.FC<HeroSectionProps> = ({
             <div className="relative w-full h-full bg-[#9DC2E6]">
               <video
                 ref={videoRef}
-                src="/assets/aistudio/Eagle_1_1304c0c3.mp4"
+                src="/assets/aistudio/Eagle_flying_toward_camera_953baa6a_1080p.mp4"
                 className="w-full h-full object-cover"
                 autoPlay
                 loop
                 muted={isMuted}
                 playsInline
+                webkit-playsinline="true"
+                preload="auto"
                 onPlay={() => setIsVideoPlaying(true)}
                 onPause={() => setIsVideoPlaying(false)}
               />
